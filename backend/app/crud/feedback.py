@@ -1,6 +1,9 @@
+import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import FeedbackEvent
+
+logger = logging.getLogger(__name__)
 
 
 async def create_or_update_feedback_event(
@@ -21,6 +24,7 @@ async def create_or_update_feedback_event(
     )
     event = result.scalar_one_or_none()
     if event is None:
+        logger.info("feedback_event_created session=%s candidate=%s action=%s", session_id, candidate_id, action)
         event = FeedbackEvent(
             session_id=session_id,
             user_id=user_id,
@@ -32,6 +36,7 @@ async def create_or_update_feedback_event(
         )
         db.add(event)
     else:
+        logger.info("feedback_event_updated session=%s candidate=%s action=%s (was %s)", session_id, candidate_id, action, event.action)
         event.action = action
         event.reason_tags = reason_tags
         event.text_note = text_note

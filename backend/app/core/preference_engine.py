@@ -2,11 +2,14 @@
 Preference learning engine.
 Computes rewards and updates user profile dimension scores.
 """
+import logging
 from .dimensions import (
     ALL_DIMENSIONS,
     REASON_TAG_DIMENSION_MAP,
     vocab_choice_to_float,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def base_learning_rate(confidence: float) -> float:
@@ -43,6 +46,8 @@ def update_profile_from_feedback(
     if reward == 0.0:
         return dim_scores, dim_confidences, dim_counts
 
+    logger.info("profile_update_start action=%s reason_tags=%s config=%s", action, reason_tags, candidate_config)
+
     # Build amplification set from reason tags — dynamic map takes precedence
     amplified_dims: set[str] = set()
     for tag in reason_tags:
@@ -77,6 +82,10 @@ def update_profile_from_feedback(
         new_scores[dim_name] = clamp(current_score + delta)
         new_confidences[dim_name] = min(1.0, current_conf + 0.05)
         new_counts[dim_name] = dim_counts.get(dim_name, 0) + 1
+
+    changed = {k: (dim_scores.get(k, 0), v) for k, v in new_scores.items() if v != dim_scores.get(k, 0)}
+    if changed:
+        logger.info("profile_update_result changed_dims=%s", changed)
 
     return new_scores, new_confidences, new_counts
 
