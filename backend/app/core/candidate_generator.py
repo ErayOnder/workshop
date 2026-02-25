@@ -17,12 +17,13 @@ from ..crud.candidates import (
 )
 from ..generator import generate_one
 from .image_analyzer import analyze_image
+from .sse_bus import publish
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
 
-async def _analyze_single(candidate_id: str, image_bytes: bytes) -> None:
+async def _analyze_single(candidate_id: str, session_id: str, image_bytes: bytes) -> None:
     """Run image analysis and persist chips to DB. Failures are non-fatal."""
     try:
         async with AsyncSessionLocal() as db:
@@ -42,6 +43,16 @@ async def _analyze_single(candidate_id: str, image_bytes: bytes) -> None:
             await set_candidate_analysis_done(db, candidate_id, result, chip_dim_map)
             await db.commit()
 
+        await publish(session_id, "analysis_done", {
+            "candidate_id": candidate_id,
+            "analysis_status": "done",
+            "image_analysis": {
+                "like_chips": result.get("like_chips", []),
+                "dislike_chips": result.get("dislike_chips", []),
+                "chip_dimension_map": chip_dim_map,
+            },
+        })
+
     except Exception as exc:
         logger.warning("Image analysis failed for candidate %s: %s", candidate_id, exc)
         try:
@@ -50,10 +61,16 @@ async def _analyze_single(candidate_id: str, image_bytes: bytes) -> None:
                 await db.commit()
         except Exception:
             pass
+        await publish(session_id, "analysis_done", {
+            "candidate_id": candidate_id,
+            "analysis_status": "failed",
+            "image_analysis": None,
+        })
 
 
 async def _generate_single(
     candidate_id: str,
+    session_id: str,
     product_image_bytes: bytes,
     mime: str,
     prompt: str,
@@ -73,14 +90,29 @@ async def _generate_single(
             await set_candidate_done(db, candidate_id, filename)
             await db.commit()
 
+        await publish(session_id, "candidate_done", {
+            "candidate_id": candidate_id,
+            "generation_status": "done",
+            "image_url": f"/v1/images/{filename}",
+            "error": None,
+            "analysis_status": "pending",
+        })
+
         # Analysis runs after image is marked done so the UI can display the image
-        # immediately. Analysis results arrive ~1-2s later via continued polling.
-        await _analyze_single(candidate_id, image_bytes)
+        # immediately. Analysis results arrive ~1-2s later via SSE.
+        await _analyze_single(candidate_id, session_id, image_bytes)
 
     except Exception as exc:
         async with AsyncSessionLocal() as db:
             await set_candidate_error(db, candidate_id, str(exc))
             await db.commit()
+        await publish(session_id, "candidate_done", {
+            "candidate_id": candidate_id,
+            "generation_status": "error",
+            "image_url": None,
+            "error": str(exc),
+            "analysis_status": "failed",
+        })
 
 
 async def generate_candidate_batch(
@@ -88,6 +120,8 @@ async def generate_candidate_batch(
     prompts: list[str],
     product_image_bytes: bytes,
     mime: str,
+    session_id: str,
+    round_number: int,
 ) -> None:
     """
     Fire 3 parallel Gemini image generation calls.
@@ -95,7 +129,12 @@ async def generate_candidate_batch(
     Intended to run as a FastAPI background task.
     """
     tasks = [
-        _generate_single(candidate_id, product_image_bytes, mime, prompt)
+        _generate_single(candidate_id, session_id, product_image_bytes, mime, prompt)
         for candidate_id, prompt in zip(candidate_ids, prompts)
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    await publish(session_id, "round_complete", {
+        "session_id": session_id,
+        "round_number": round_number,
+    })

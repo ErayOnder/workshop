@@ -1,7 +1,10 @@
+import asyncio
+import json
 import logging
 import uuid
 from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.database import get_db
@@ -47,6 +50,7 @@ from ..core.preference_engine import (
     should_exploit,
 )
 from ..core.candidate_generator import generate_candidate_batch
+from ..core.sse_bus import subscribe, unsubscribe
 
 router = APIRouter(tags=["sessions"])
 logger = logging.getLogger(__name__)
@@ -131,7 +135,10 @@ async def create_new_session(
 
     # Fire generation in background
     candidate_ids = [c.id for c in candidates]
-    background_tasks.add_task(generate_candidate_batch, candidate_ids, prompts, image_bytes, mime)
+    background_tasks.add_task(
+        generate_candidate_batch, candidate_ids, prompts, image_bytes, mime,
+        session.id, round_number,
+    )
 
     return CreateSessionResponse(
         session_id=session.id,
@@ -160,6 +167,97 @@ async def poll_candidates(
         round_number=session.round_number,
         candidates=[_candidate_to_out(c) for c in candidates],
     )
+
+
+# --------------------------------------------------------------------------- #
+# GET /v1/sessions/{session_id}/events — SSE stream for generation status     #
+# --------------------------------------------------------------------------- #
+
+@router.get("/sessions/{session_id}/events")
+async def candidate_events(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    session = await get_session(db, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+
+    candidates = await get_candidates_for_round(db, session_id, session.round_number)
+
+    async def event_stream():
+        # Subscribe before reading current state to avoid missing events in the gap.
+        q = subscribe(session_id)
+        try:
+            # Catch-up: replay already-finished candidates immediately.
+            all_settled = True
+            for c in candidates:
+                if c.generation_status in ("done", "error"):
+                    yield _sse("candidate_done", {
+                        "candidate_id": c.id,
+                        "generation_status": c.generation_status,
+                        "image_url": _candidate_url(c.image_filename) if c.image_filename else None,
+                        "error": c.generation_error,
+                        "analysis_status": c.analysis_status,
+                    })
+                else:
+                    all_settled = False
+
+                if c.analysis_status in ("done", "failed"):
+                    analysis = None
+                    if c.image_analysis and c.chip_dimension_map:
+                        chip_dim_map = {
+                            chip["id"]: chip["dimensions"]
+                            for chip in c.image_analysis.get("like_chips", []) + c.image_analysis.get("dislike_chips", [])
+                        }
+                        analysis = {
+                            "like_chips": c.image_analysis.get("like_chips", []),
+                            "dislike_chips": c.image_analysis.get("dislike_chips", []),
+                            "chip_dimension_map": chip_dim_map,
+                        }
+                    yield _sse("analysis_done", {
+                        "candidate_id": c.id,
+                        "analysis_status": c.analysis_status,
+                        "image_analysis": analysis,
+                    })
+                elif c.generation_status not in ("done", "error"):
+                    all_settled = False
+
+            if all_settled:
+                yield _sse("round_complete", {
+                    "session_id": session_id,
+                    "round_number": session.round_number,
+                })
+                return
+
+            # Forward live events from the bus until round_complete.
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield _sse(msg["event"], msg["data"])
+                if msg["event"] == "round_complete":
+                    break
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            unsubscribe(session_id, q)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -304,7 +402,10 @@ async def next_round(
 
     # Fire generation in background
     next_ids = [c.id for c in next_candidates]
-    background_tasks.add_task(generate_candidate_batch, next_ids, prompts, product_image_bytes, mime)
+    background_tasks.add_task(
+        generate_candidate_batch, next_ids, prompts, product_image_bytes, mime,
+        session_id, round_number,
+    )
 
     return NextRoundResponse(
         advanced=True,
