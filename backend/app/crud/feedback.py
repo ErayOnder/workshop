@@ -20,6 +20,7 @@ async def create_or_update_feedback_event(
         select(FeedbackEvent).where(
             FeedbackEvent.session_id == session_id,
             FeedbackEvent.candidate_id == candidate_id,
+            FeedbackEvent.action == action,
         )
     )
     event = result.scalar_one_or_none()
