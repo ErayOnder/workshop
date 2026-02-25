@@ -14,7 +14,7 @@ type Props = {
     tags: string[],
     note?: string,
     chipDimensionMap?: Record<string, string[]>
-  ) => void;
+  ) => Promise<void>;
   onNext: () => void;
   onDone: () => void;
 };
@@ -43,7 +43,7 @@ export default function FeedbackPanel({
 
   function handleAction(action: FeedbackAction) {
     if (action === "save") {
-      onFeedback("save", []);
+      void onFeedback("save", []);
       return;
     }
     setPendingAction(action);
@@ -56,7 +56,7 @@ export default function FeedbackPanel({
     chipDimensionMap?: Record<string, string[]>
   ) {
     if (pendingAction) {
-      onFeedback(pendingAction, tags, note, chipDimensionMap);
+      void onFeedback(pendingAction, tags, note, chipDimensionMap);
     }
     setShowChips(false);
     setPendingAction(null);
@@ -66,6 +66,24 @@ export default function FeedbackPanel({
 
   // ChipTray only shows chips for the current pending action
   const activeSentiments = new Set<"like" | "dislike">(pendingAction ? [pendingAction] : []);
+  const initialTags =
+    pendingAction === "like"
+      ? (candidateFeedback?.like.chips ?? [])
+      : pendingAction === "dislike"
+        ? (candidateFeedback?.dislike.chips ?? [])
+        : [];
+  const initialNote =
+    pendingAction === "like"
+      ? candidateFeedback?.like.note
+      : pendingAction === "dislike"
+        ? candidateFeedback?.dislike.note
+        : undefined;
+  const hasExistingSubmission =
+    pendingAction === "like"
+      ? (candidateFeedback?.like.submitted ?? false)
+      : pendingAction === "dislike"
+        ? (candidateFeedback?.dislike.submitted ?? false)
+        : false;
 
   return (
     <div className="feedback-panel">
@@ -108,6 +126,9 @@ export default function FeedbackPanel({
           activeSentiments={activeSentiments}
           imageAnalysis={selectedCandidate?.image_analysis ?? null}
           analysisStatus={selectedCandidate?.analysis_status ?? "pending"}
+          initialTags={initialTags}
+          initialNote={initialNote}
+          hasExistingSubmission={hasExistingSubmission}
           onSubmit={handleChipSubmit}
         />
       )}

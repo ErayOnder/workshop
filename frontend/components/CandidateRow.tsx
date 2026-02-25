@@ -28,7 +28,7 @@ export default function CandidateRow({
         const fb = feedbackByCandidate[c.candidate_id];
         const likeSubmitted = fb?.like.submitted ?? false;
         const dislikeSubmitted = fb?.dislike.submitted ?? false;
-        const tickCount = (likeSubmitted ? 1 : 0) + (dislikeSubmitted ? 1 : 0);
+        const hasAnyFeedback = likeSubmitted || dislikeSubmitted;
 
         return (
           <button
@@ -51,11 +51,19 @@ export default function CandidateRow({
                 <span>Failed</span>
               </div>
             )}
-            {tickCount === 1 && (
-              <div className="candidate-thumb-reviewed">✓</div>
-            )}
-            {tickCount === 2 && (
-              <div className="candidate-thumb-reviewed candidate-thumb-reviewed--double">✓✓</div>
+            {hasAnyFeedback && (
+              <div className="candidate-thumb-reviewed-stack">
+                {likeSubmitted && (
+                  <div className="candidate-thumb-reviewed" title="Like submitted">
+                    ✓
+                  </div>
+                )}
+                {dislikeSubmitted && (
+                  <div className="candidate-thumb-reviewed" title="Dislike submitted">
+                    ✓
+                  </div>
+                )}
+              </div>
             )}
             {isSelected && <div className="candidate-thumb-ring" />}
           </button>

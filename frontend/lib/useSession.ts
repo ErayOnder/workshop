@@ -51,6 +51,8 @@ export type SessionHook = {
   savedCandidateId: string | null;
   feedbackByCandidate: Record<string, CandidateLocalFeedback>;
   finalizeResult: FinalizeResult | null;
+  canGoNext: boolean;
+  hasPendingFeedback: boolean;
 
   startSession: (file: File, category?: JewelryCategory) => Promise<void>;
   selectCandidate: (id: string) => void;
@@ -77,8 +79,10 @@ export function useSession(): SessionHook {
   const [savedCandidateId, setSavedCandidateId] = useState<string | null>(null);
   const [feedbackByCandidate, setFeedbackByCandidate] = useState<Record<string, CandidateLocalFeedback>>({});
   const [finalizeResult, setFinalizeResult] = useState<FinalizeResult | null>(null);
+  const [pendingFeedbackCount, setPendingFeedbackCount] = useState(0);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const pendingFeedbackRequestsRef = useRef<Set<Promise<unknown>>>(new Set());
 
   const stopStream = useCallback(() => {
     if (eventSourceRef.current) {
@@ -138,6 +142,8 @@ export function useSession(): SessionHook {
         setSavedCandidateId(null);
         setFeedbackByCandidate({});
         setFinalizeResult(null);
+        setPendingFeedbackCount(0);
+        pendingFeedbackRequestsRef.current.clear();
         setPhase("review");
         startStream(session.session_id);
       } catch (err: unknown) {
@@ -154,20 +160,20 @@ export function useSession(): SessionHook {
   }, []);
 
   const advanceToNextRound = useCallback(
-    async (force: boolean) => {
+    async () => {
       if (!sessionId) return;
       try {
-        const result = await nextRound(sessionId, force);
+        const result = await nextRound(sessionId, true);
         const next = result.next_candidates;
         setCandidates(next);
         setRoundNumber(result.round_number);
         setSelectedCandidateId(next[0]?.candidate_id ?? null);
         setFeedbackByCandidate({});
+        setPendingFeedbackCount(0);
         setError(null);
         startStream(sessionId);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Failed to load next round";
-        if (!force && message.toLowerCase().includes("feedback incomplete")) return;
         setError(message);
       }
     },
@@ -184,60 +190,61 @@ export function useSession(): SessionHook {
       if (!sessionId || !selectedCandidateId) return;
       if (action === "save") setSavedCandidateId(selectedCandidateId);
 
-      try {
-        await submitFeedback(
-          sessionId,
-          selectedCandidateId,
-          action,
-          tags,
-          note,
-          chipDimensionMap
-        );
-
-        // Build updated feedback map locally (don't wait for re-render)
-        const prev = feedbackByCandidate[selectedCandidateId] ?? emptyFeedback();
-        const updatedEntry: CandidateLocalFeedback =
-          action === "like"
-            ? { ...prev, like: { submitted: true, chips: tags, chipDimMap: chipDimensionMap ?? {}, note } }
-            : action === "dislike"
+      // Optimistic local update so revisiting a candidate shows prior choice immediately.
+      const prev = feedbackByCandidate[selectedCandidateId] ?? emptyFeedback();
+      const updatedEntry: CandidateLocalFeedback =
+        action === "like"
+          ? { ...prev, like: { submitted: true, chips: tags, chipDimMap: chipDimensionMap ?? {}, note } }
+          : action === "dislike"
             ? { ...prev, dislike: { submitted: true, chips: tags, chipDimMap: chipDimensionMap ?? {}, note } }
             : { ...prev, save: true };
+      const updatedFeedback = { ...feedbackByCandidate, [selectedCandidateId]: updatedEntry };
+      setFeedbackByCandidate(updatedFeedback);
+      setError(null);
 
-        const updatedFeedback = { ...feedbackByCandidate, [selectedCandidateId]: updatedEntry };
-        setFeedbackByCandidate(updatedFeedback);
-        setError(null);
+      // Move to next unactioned candidate; next-round is now explicit via the Next button.
+      const nextUnactioned = candidates.find((c) => {
+        const fb = updatedFeedback[c.candidate_id];
+        return !fb?.like.submitted && !fb?.dislike.submitted;
+      });
+      if (nextUnactioned) {
+        setSelectedCandidateId(nextUnactioned.candidate_id);
+      }
 
-        // Auto-advance once all candidates have at least one like or dislike
-        const allActioned =
-          candidates.length > 0 &&
-          candidates.every((c) => {
-            const fb = updatedFeedback[c.candidate_id];
-            return fb?.like.submitted || fb?.dislike.submitted;
-          });
+      setPendingFeedbackCount((n) => n + 1);
+      const requestPromise = submitFeedback(
+        sessionId,
+        selectedCandidateId,
+        action,
+        tags,
+        note,
+        chipDimensionMap
+      );
+      pendingFeedbackRequestsRef.current.add(requestPromise);
 
-        if (allActioned) {
-          await advanceToNextRound(false);
-          return;
-        }
-
-        // Move to next unactioned candidate
-        const nextUnactioned = candidates.find((c) => {
-          const fb = updatedFeedback[c.candidate_id];
-          return !fb?.like.submitted && !fb?.dislike.submitted;
-        });
-        if (nextUnactioned) {
-          setSelectedCandidateId(nextUnactioned.candidate_id);
-        }
+      try {
+        await requestPromise;
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : "Failed to submit feedback");
+      } finally {
+        pendingFeedbackRequestsRef.current.delete(requestPromise);
+        setPendingFeedbackCount((n) => Math.max(0, n - 1));
       }
     },
-    [sessionId, selectedCandidateId, feedbackByCandidate, candidates, advanceToNextRound]
+    [sessionId, selectedCandidateId, candidates, feedbackByCandidate]
   );
 
   const goNextRound = useCallback(async () => {
-    await advanceToNextRound(true);
+    // Prevent race: wait for all in-flight feedback writes before generation starts.
+    const inflight = Array.from(pendingFeedbackRequestsRef.current);
+    if (inflight.length > 0) {
+      await Promise.allSettled(inflight);
+    }
+
+    await advanceToNextRound();
   }, [advanceToNextRound]);
+
+  const canGoNext = candidates.length > 0 && !isLoading;
 
   const doFinalize = useCallback(
     async (selectedId: string) => {
@@ -266,6 +273,8 @@ export function useSession(): SessionHook {
     setSelectedCandidateId(null);
     setSavedCandidateId(null);
     setFeedbackByCandidate({});
+    setPendingFeedbackCount(0);
+    pendingFeedbackRequestsRef.current.clear();
     setFinalizeResult(null);
     setError(null);
     setRoundNumber(0);
@@ -283,6 +292,8 @@ export function useSession(): SessionHook {
     savedCandidateId,
     feedbackByCandidate,
     finalizeResult,
+    canGoNext,
+    hasPendingFeedback: pendingFeedbackCount > 0,
     startSession,
     selectCandidate,
     submitFeedbackAction,

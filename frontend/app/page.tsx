@@ -115,7 +115,7 @@ export default function Home() {
               ? (session.feedbackByCandidate[session.selectedCandidateId] ?? null)
               : null
           }
-          canGoNext={session.candidates.length > 0}
+          canGoNext={session.canGoNext}
           onFeedback={session.submitFeedbackAction}
           onNext={handleNext}
           onDone={handleDone}

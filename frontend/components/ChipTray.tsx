@@ -13,21 +13,36 @@ type Props = {
   activeSentiments: Set<"like" | "dislike">;
   imageAnalysis: ImageAnalysisData | null;
   analysisStatus: AnalysisStatus;
+  initialTags?: string[];
+  initialNote?: string;
+  hasExistingSubmission?: boolean;
   onSubmit: (tags: string[], note?: string, chipDimensionMap?: Record<string, string[]>) => void;
 };
 
 // After this many ms of pending/running analysis, fall back to static chips
 const ANALYSIS_FALLBACK_MS = 3000;
 
+function normalizeTag(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 export default function ChipTray({
   activeSentiments,
   imageAnalysis,
   analysisStatus,
+  initialTags = [],
+  initialNote,
+  hasExistingSubmission = false,
   onSubmit,
 }: Props) {
-  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set(initialTags));
   const [showOther, setShowOther] = useState(false);
-  const [otherText, setOtherText] = useState("");
+  const [otherText, setOtherText] = useState(initialNote ?? "");
   const [fallbackTriggered, setFallbackTriggered] = useState(false);
 
   const isAnalysisPending = analysisStatus === "pending" || analysisStatus === "running";
@@ -43,6 +58,12 @@ export default function ChipTray({
     return () => clearTimeout(t);
   }, [isAnalysisPending]);
 
+  useEffect(() => {
+    setSelectedTags(new Set(initialTags));
+    setOtherText(initialNote ?? "");
+    setShowOther(Boolean(initialNote));
+  }, [initialTags, initialNote]);
+
   const showLoadingSkeleton = isAnalysisPending && !fallbackTriggered;
 
   // Determine which chips to show
@@ -57,6 +78,20 @@ export default function ChipTray({
     ...(activeSentiments.has("like") ? likeChips : []),
     ...(activeSentiments.has("dislike") ? dislikeChips : []),
   ];
+  const previouslySubmittedNormalizedTags = new Set(initialTags.map(normalizeTag));
+  const normalizedCurrentTags = Array.from(selectedTags).sort();
+  const normalizedInitialTags = [...initialTags].sort();
+  const normalizedCurrentNote = otherText.trim();
+  const normalizedInitialNote = (initialNote ?? "").trim();
+  const isDuplicateSubmission =
+    hasExistingSubmission &&
+    normalizedCurrentNote === normalizedInitialNote &&
+    normalizedCurrentTags.length === normalizedInitialTags.length &&
+    normalizedCurrentTags.every((tag, idx) => tag === normalizedInitialTags[idx]);
+  const duplicateReason =
+    normalizedInitialTags.length > 0
+      ? `${normalizedInitialTags.join(", ")} zaten gonderildi.`
+      : "Bu feedback kombinasyonunu zaten gonderdiniz.";
 
   function toggleTag(id: string) {
     setSelectedTags((prev) => {
@@ -105,16 +140,39 @@ export default function ChipTray({
     <div className="chip-tray">
       <p className="chip-tray-hint">What stood out? (optional)</p>
       <div className="chip-list">
-        {chips.map((chip) => (
-          <button
-            key={chip.id}
-            type="button"
-            className={`chip${selectedTags.has(chip.id) ? " chip--selected" : ""}`}
-            onClick={() => toggleTag(chip.id)}
-          >
-            {chip.label}
-          </button>
-        ))}
+        {chips.map((chip) => {
+          const isSelected = selectedTags.has(chip.id);
+          const isPreviouslySubmitted =
+            hasExistingSubmission &&
+            (
+              previouslySubmittedNormalizedTags.has(normalizeTag(chip.id)) ||
+              previouslySubmittedNormalizedTags.has(normalizeTag(chip.label))
+            );
+
+          return (
+            <button
+              key={chip.id}
+              type="button"
+              className={[
+                "chip",
+                isSelected ? "chip--selected" : "",
+                isPreviouslySubmitted ? "chip--previously-submitted" : "",
+                isPreviouslySubmitted ? "chip--locked" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              onClick={() => toggleTag(chip.id)}
+              disabled={isPreviouslySubmitted}
+              title={
+                isPreviouslySubmitted
+                  ? "Bu chip daha once gonderildi ve tekrar secilemez."
+                  : undefined
+              }
+            >
+              {chip.label}
+            </button>
+          );
+        })}
         <button
           type="button"
           className={`chip${showOther ? " chip--selected" : ""}`}
@@ -135,8 +193,16 @@ export default function ChipTray({
         />
       )}
 
-      <button type="button" className="chip-submit-btn" onClick={handleSubmit}>
-        {selectedTags.size > 0 || otherText ? "Submit feedback" : "Skip"}
+      <button
+        type="button"
+        className={`chip-submit-btn${isDuplicateSubmission ? " chip-submit-btn--blocked" : ""}`}
+        onClick={handleSubmit}
+        disabled={isDuplicateSubmission}
+        title={isDuplicateSubmission ? duplicateReason : undefined}
+      >
+        {isDuplicateSubmission
+          ? "Already submitted"
+          : (selectedTags.size > 0 || otherText ? "Submit feedback" : "Skip")}
       </button>
     </div>
   );

@@ -64,55 +64,65 @@ async def analyze_image(image_bytes: bytes) -> dict | None:
     """
     Run Gemini vision analysis on a generated image.
     Returns {"like_chips": [...], "dislike_chips": [...]} or None on any failure.
+    Retries once on JSON parse errors (Gemini sometimes returns invalid JSON).
     """
-    try:
-        client = genai.Client(api_key=settings.gemini_api_key)
+    client = genai.Client(api_key=settings.gemini_api_key)
+    contents = [
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+        types.Part.from_text(text=_ANALYSIS_PROMPT),
+    ]
+    last_error: Exception | None = None
 
-        contents = [
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-            types.Part.from_text(text=_ANALYSIS_PROMPT),
-        ]
-
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_analysis_model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT"],
-            ),
-        )
-
-        if not response.candidates:
-            logger.warning("Image analysis: Gemini returned no candidates")
-            return None
-
-        raw_text = ""
-        for part in response.candidates[0].content.parts:
-            if part.text:
-                raw_text += part.text
-
-        raw_text = raw_text.strip()
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("```")[1]
-            if raw_text.startswith("json"):
-                raw_text = raw_text[4:]
-            raw_text = raw_text.strip()
-
-        data = json.loads(raw_text)
-
-        like_chips = _validate_chips(data.get("like_chips", []))
-        dislike_chips = _validate_chips(data.get("dislike_chips", []))
-
-        if len(like_chips) < 2 or len(dislike_chips) < 2:
-            logger.warning(
-                "Image analysis: insufficient chips after validation (like=%d, dislike=%d)",
-                len(like_chips),
-                len(dislike_chips),
+    for attempt in range(2):
+        try:
+            response = await client.aio.models.generate_content(
+                model=settings.gemini_analysis_model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT"],
+                ),
             )
+
+            if not response.candidates:
+                logger.warning("Image analysis: Gemini returned no candidates")
+                return None
+
+            raw_text = ""
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    raw_text += part.text
+
+            raw_text = raw_text.strip()
+            # Strip markdown code fences if present
+            if raw_text.startswith("```"):
+                raw_text = raw_text.split("```")[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+                raw_text = raw_text.strip()
+
+            data = json.loads(raw_text)
+
+            like_chips = _validate_chips(data.get("like_chips", []))
+            dislike_chips = _validate_chips(data.get("dislike_chips", []))
+
+            if len(like_chips) < 2 or len(dislike_chips) < 2:
+                logger.warning(
+                    "Image analysis: insufficient chips after validation (like=%d, dislike=%d)",
+                    len(like_chips),
+                    len(dislike_chips),
+                )
+                return None
+
+            return {"like_chips": like_chips, "dislike_chips": dislike_chips}
+
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            logger.warning("Image analysis JSON parse failed (attempt %d/2): %s", attempt + 1, exc)
+            # Retry once; second response may be valid
+        except Exception as exc:
+            logger.warning("Image analysis failed: %s", exc)
             return None
 
-        return {"like_chips": like_chips, "dislike_chips": dislike_chips}
-
-    except Exception as exc:
-        logger.warning("Image analysis failed: %s", exc)
-        return None
+    if last_error:
+        logger.warning("Image analysis failed after retry: %s", last_error)
+    return None
