@@ -280,11 +280,6 @@ async def submit_feedback(
     if candidate is None or candidate.session_id != session_id:
         raise HTTPException(404, "Candidate not found in this session")
 
-    logger.info(
-        "feedback_received session=%s candidate=%s action=%s reason_tags=%s text_note=%s",
-        session_id, body.candidate_id, body.action, body.reason_tags, body.text_note,
-    )
-
     # Get current profile
     profile = await get_or_create_profile(db, session.user_id)
     dim_map = await get_dimensions(db, profile.id)
@@ -294,7 +289,10 @@ async def submit_feedback(
 
     # Compute reward and update profile
     reward = compute_reward(body.action)
-    logger.info("feedback_reward session=%s action=%s reward=%.2f", session_id, body.action, reward)
+    logger.info(
+        "feedback_received session=%s candidate=%s action=%s reason_tags=%s text_note=%s reward=%.2f",
+        session_id, body.candidate_id, body.action, body.reason_tags, body.text_note, reward,
+    )
 
     new_scores, new_confs, new_counts = update_profile_from_feedback(
         profile_scores,
@@ -331,8 +329,6 @@ async def submit_feedback(
     )
 
     await db.commit()
-
-    logger.info("feedback_saved session=%s candidate=%s event_id=%s", session_id, body.candidate_id, event.id)
 
     return FeedbackResponse(
         feedback_accepted=True,

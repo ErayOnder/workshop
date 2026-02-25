@@ -12,6 +12,8 @@ coloredlogs.install(
     fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Suppress google_genai AFC info logs
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
