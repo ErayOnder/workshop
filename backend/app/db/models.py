@@ -61,6 +61,11 @@ class Candidate(Base):
     image_filename: Mapped[str | None] = mapped_column(String, nullable=True)
     generation_status: Mapped[str] = mapped_column(String, default="pending")  # pending|generating|done|error
     generation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Image analysis columns — added for per-image dynamic feedback chips.
+    # Dev: delete backend/data/workshop.db to recreate schema if upgrading existing DB.
+    analysis_status: Mapped[str] = mapped_column(String, default="pending")  # pending|running|done|failed
+    image_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"like_chips":[...], "dislike_chips":[...]}
+    chip_dimension_map: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {"chip_id": ["dim1", ...], ...}
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     session: Mapped["Session"] = relationship(back_populates="candidates", lazy="select")

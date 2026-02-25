@@ -12,6 +12,9 @@ from ..schemas import (
     CreateSessionResponse,
     FeedbackRequest,
     FeedbackResponse,
+    ImageAnalysisData,
+    NextRoundRequest,
+    NextRoundResponse,
     FinalizeRequest,
     FinalizeResponse,
 )
@@ -28,7 +31,7 @@ from ..crud.candidates import (
     get_candidate,
     get_candidates_for_round,
 )
-from ..crud.feedback import create_feedback_event
+from ..crud.feedback import create_or_update_feedback_event
 from ..crud.profiles import (
     get_or_create_profile,
     get_dimensions,
@@ -54,11 +57,20 @@ def _candidate_url(filename: str) -> str:
 
 
 def _candidate_to_out(c: Candidate) -> CandidateOut:
+    analysis: ImageAnalysisData | None = None
+    if c.image_analysis and c.chip_dimension_map:
+        analysis = ImageAnalysisData(
+            like_chips=c.image_analysis.get("like_chips", []),
+            dislike_chips=c.image_analysis.get("dislike_chips", []),
+            chip_dimension_map=c.chip_dimension_map,
+        )
     return CandidateOut(
         candidate_id=c.id,
         generation_status=c.generation_status,  # type: ignore[arg-type]
         image_url=_candidate_url(c.image_filename) if c.image_filename else None,
         error=c.generation_error,
+        analysis_status=c.analysis_status,  # type: ignore[arg-type]
+        image_analysis=analysis,
     )
 
 
@@ -149,14 +161,13 @@ async def poll_candidates(
 
 
 # --------------------------------------------------------------------------- #
-# POST /v1/sessions/{session_id}/feedback — submit feedback + get next round  #
+# POST /v1/sessions/{session_id}/feedback — submit feedback only               #
 # --------------------------------------------------------------------------- #
 
 @router.post("/sessions/{session_id}/feedback", response_model=FeedbackResponse)
 async def submit_feedback(
     session_id: str,
     body: FeedbackRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     session = await get_session(db, session_id)
@@ -185,6 +196,7 @@ async def submit_feedback(
         candidate.generation_config,
         body.action,
         body.reason_tags,
+        body.chip_dimension_map or None,
     )
 
     # Persist updated dimensions
@@ -199,8 +211,8 @@ async def submit_feedback(
         )
     await increment_profile_interactions(db, profile)
 
-    # Store feedback event
-    await create_feedback_event(
+    # Store feedback event (upsert by candidate so edits overwrite prior choice)
+    await create_or_update_feedback_event(
         db,
         session_id=session_id,
         user_id=session.user_id,
@@ -211,10 +223,46 @@ async def submit_feedback(
         reward=reward,
     )
 
-    # Determine exploit mode (consecutive_likes not used in V1; avoid lazy-loading session.feedback_events in async context)
-    consecutive_likes = _count_consecutive_likes(session_id, db)
-    save_ever_pressed = body.action == "save"
-    exploit = should_exploit(session.round_number, save_ever_pressed, 0)
+    await db.commit()
+
+    return FeedbackResponse(
+        feedback_accepted=True,
+        reward=reward,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# POST /v1/sessions/{session_id}/next-round — generate next round candidates  #
+# --------------------------------------------------------------------------- #
+
+@router.post("/sessions/{session_id}/next-round", response_model=NextRoundResponse)
+async def next_round(
+    session_id: str,
+    body: NextRoundRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    session = await get_session(db, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    if session.status == "finalized":
+        raise HTTPException(400, "Session is already finalized")
+
+    current_candidates = await get_candidates_for_round(db, session_id, session.round_number)
+    if not current_candidates:
+        raise HTTPException(400, "No candidates in current round")
+
+    if not body.force and not await _is_round_feedback_complete(db, session_id, session.round_number):
+        raise HTTPException(409, "Feedback incomplete for current round")
+
+    # Get latest profile state for next-round proposal
+    profile = await get_or_create_profile(db, session.user_id)
+    dim_map = await get_dimensions(db, profile.id)
+    profile_scores = {n: d.score for n, d in dim_map.items()}
+
+    # Determine exploit mode (consecutive_likes not used in V1)
+    save_pressed = await _save_exists_for_round(db, session_id, session.round_number)
+    exploit = should_exploit(session.round_number, save_pressed, 0)
 
     # Advance to next round
     round_number = await increment_round(db, session)
@@ -232,7 +280,7 @@ async def submit_feedback(
     mime = _guess_mime(product.image_filename)
 
     # Generate next 3 configs + prompts
-    configs = generate_three_configs(new_scores, round_number, None, exploit_mode=exploit)
+    configs = generate_three_configs(profile_scores, round_number, None, exploit_mode=exploit)
     prompts = [compile_prompt(c) for c in configs]
 
     # Create candidate rows for next round
@@ -247,9 +295,9 @@ async def submit_feedback(
     next_ids = [c.id for c in next_candidates]
     background_tasks.add_task(generate_candidate_batch, next_ids, prompts, product_image_bytes, mime)
 
-    return FeedbackResponse(
-        feedback_accepted=True,
-        reward=reward,
+    return NextRoundResponse(
+        advanced=True,
+        round_number=round_number,
         next_candidates=[_candidate_to_out(c) for c in next_candidates],
     )
 
@@ -257,6 +305,44 @@ async def submit_feedback(
 def _count_consecutive_likes(session_id: str, db: AsyncSession) -> int:
     # Simplified — in V1 we just return 0; proper counting requires session history
     return 0
+
+
+async def _is_round_feedback_complete(db: AsyncSession, session_id: str, round_number: int) -> bool:
+    from sqlalchemy import select as sa_select
+    from ..db.models import FeedbackEvent
+
+    round_candidates = await get_candidates_for_round(db, session_id, round_number)
+    if not round_candidates:
+        return False
+
+    candidate_ids = {c.id for c in round_candidates}
+    feedback_result = await db.execute(
+        sa_select(FeedbackEvent.candidate_id).where(
+            FeedbackEvent.session_id == session_id,
+            FeedbackEvent.candidate_id.in_(candidate_ids),
+        )
+    )
+    reviewed_ids = set(feedback_result.scalars().all())
+    return candidate_ids.issubset(reviewed_ids)
+
+
+async def _save_exists_for_round(db: AsyncSession, session_id: str, round_number: int) -> bool:
+    from sqlalchemy import select as sa_select
+    from ..db.models import FeedbackEvent
+
+    round_candidates = await get_candidates_for_round(db, session_id, round_number)
+    if not round_candidates:
+        return False
+    candidate_ids = {c.id for c in round_candidates}
+
+    result = await db.execute(
+        sa_select(FeedbackEvent.id).where(
+            FeedbackEvent.session_id == session_id,
+            FeedbackEvent.action == "save",
+            FeedbackEvent.candidate_id.in_(candidate_ids),
+        )
+    )
+    return result.scalar_one_or_none() is not None
 
 
 def _guess_mime(filename: str) -> str:

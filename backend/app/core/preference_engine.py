@@ -30,19 +30,26 @@ def update_profile_from_feedback(
     candidate_config: dict[str, str],
     action: str,
     reason_tags: list[str],
+    dynamic_chip_map: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, int]]:
     """
     Update dimension scores based on user feedback.
     Returns updated (scores, confidences, counts) dicts.
+
+    dynamic_chip_map: optional per-image chip→dimension mapping from image analysis.
+    When provided, dynamic mappings take precedence over static REASON_TAG_DIMENSION_MAP.
     """
     reward = compute_reward(action)
     if reward == 0.0:
         return dim_scores, dim_confidences, dim_counts
 
-    # Build amplification map from reason tags
+    # Build amplification set from reason tags — dynamic map takes precedence
     amplified_dims: set[str] = set()
     for tag in reason_tags:
-        amplified_dims.update(REASON_TAG_DIMENSION_MAP.get(tag, []))
+        if dynamic_chip_map and tag in dynamic_chip_map:
+            amplified_dims.update(dynamic_chip_map[tag])
+        else:
+            amplified_dims.update(REASON_TAG_DIMENSION_MAP.get(tag, []))
 
     new_scores = dict(dim_scores)
     new_confidences = dict(dim_confidences)

@@ -62,3 +62,34 @@ async def set_candidate_error(db: AsyncSession, candidate_id: str, error: str) -
         candidate.generation_status = "error"
         candidate.generation_error = error
         await db.flush()
+
+
+async def set_candidate_analysis_running(db: AsyncSession, candidate_id: str) -> None:
+    result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+    candidate = result.scalar_one_or_none()
+    if candidate:
+        candidate.analysis_status = "running"
+        await db.flush()
+
+
+async def set_candidate_analysis_done(
+    db: AsyncSession,
+    candidate_id: str,
+    image_analysis: dict,
+    chip_dimension_map: dict,
+) -> None:
+    result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+    candidate = result.scalar_one_or_none()
+    if candidate:
+        candidate.analysis_status = "done"
+        candidate.image_analysis = image_analysis
+        candidate.chip_dimension_map = chip_dimension_map
+        await db.flush()
+
+
+async def set_candidate_analysis_failed(db: AsyncSession, candidate_id: str) -> None:
+    result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+    candidate = result.scalar_one_or_none()
+    if candidate:
+        candidate.analysis_status = "failed"
+        await db.flush()

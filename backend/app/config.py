@@ -5,6 +5,7 @@ from pathlib import Path
 class Settings(BaseSettings):
     gemini_api_key: str
     gemini_image_model: str = "gemini-2.5-flash-image"
+    gemini_analysis_model: str = "gemini-2.5-flash"
     outputs_dir: Path = Path("data/outputs")
     uploads_dir: Path = Path("data/uploads")
     cors_origins: str = "http://localhost:3000"
