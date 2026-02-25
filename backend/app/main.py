@@ -1,9 +1,17 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .api import router
 from .config import settings
+from .db.database import init_db
 
-app = FastAPI(title="Workshop — Ring Shot Generator", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Workshop — Jewelry Style Generator", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,4 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
+# V1 personalization API
+from .v1.router import router as v1_router  # noqa: E402
+app.include_router(v1_router, prefix="/v1")
