@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +28,8 @@ from ..crud.sessions import (
     get_session,
     increment_round,
     finalize_session,
+    get_creative_context,
+    save_creative_context,
 )
 from ..crud.candidates import (
     create_candidate,
@@ -36,19 +37,8 @@ from ..crud.candidates import (
     get_candidates_for_round,
 )
 from ..crud.feedback import create_or_update_feedback_event
-from ..crud.profiles import (
-    get_or_create_profile,
-    get_dimensions,
-    upsert_dimension,
-    increment_profile_interactions,
-)
-from ..core.prompt_agent import generate_three_configs, compile_prompt
-from ..core.preference_engine import (
-    compute_reward,
-    update_profile_from_feedback,
-    blend_session_into_longterm,
-    should_exploit,
-)
+from ..core.creative_director import generate_scene_briefs
+from ..core.feedback_processor import extract_corrections_and_updates, update_creative_context
 from ..core.candidate_generator import generate_candidate_batch
 from ..core.sse_bus import subscribe, unsubscribe
 
@@ -56,6 +46,16 @@ router = APIRouter(tags=["sessions"])
 logger = logging.getLogger(__name__)
 
 ALLOWED_MIMES = {"image/jpeg", "image/png", "image/webp"}
+
+_EMPTY_CONTEXT: dict = {
+    "structural": {},
+    "corrections": [],
+    "scene_history": [],
+    "liked_tags": [],
+    "disliked_tags": [],
+}
+
+_REWARD_MAP = {"like": 1.0, "dislike": -1.0, "save": 4.0}
 
 
 def _candidate_url(filename: str) -> str:
@@ -92,48 +92,49 @@ async def create_new_session(
     user_id: str = Form(default=""),
     category: str = Form(default=""),
 ):
-    # Validate image
     if image.content_type not in ALLOWED_MIMES:
         raise HTTPException(400, f"Unsupported image type: {image.content_type}")
 
     image_bytes = await image.read()
     mime = image.content_type
 
-    # Resolve user (create anonymous if needed)
     if not user_id:
         user_id = str(uuid.uuid4())
     await ensure_user(db, user_id)
 
-    # Save product image
     product_filename = f"{uuid.uuid4()}.png"
     product_path = settings.uploads_dir / product_filename
     product_path.write_bytes(image_bytes)
 
-    # Create product + session
     product = await create_product(db, user_id, category or None, product_filename)
     session = await create_session(db, user_id, product.id)
 
-    # Advance to round 1
     round_number = await increment_round(db, session)
 
-    # Load preference profile
-    profile = await get_or_create_profile(db, user_id)
-    dim_map = await get_dimensions(db, profile.id)
-    profile_scores = {name: dim.score for name, dim in dim_map.items()}
+    # Generate 3 creative scene briefs via LLM
+    context = dict(_EMPTY_CONTEXT)
+    scenes = await generate_scene_briefs(context, category or None, round_number)
+    await save_creative_context(db, session, context)
 
-    # Generate 3 configs + prompts
-    configs = generate_three_configs(profile_scores, round_number, category or None)
-    prompts = [compile_prompt(c) for c in configs]
-
-    # Create candidate rows
     candidates: list[Candidate] = []
-    for config, prompt in zip(configs, prompts):
-        c = await create_candidate(db, session.id, round_number, config, prompt)
+    for scene in scenes:
+        c = await create_candidate(
+            db,
+            session.id,
+            round_number,
+            generation_config={
+                "scene_title": scene["scene_title"],
+                "aesthetic_tags": scene["aesthetic_tags"],
+                "slot": scene["slot"],
+                "fields": scene["fields"],
+            },
+            rendered_prompt=scene["scene_brief"],
+        )
         candidates.append(c)
 
     await db.commit()
 
-    # Fire generation in background
+    prompts = [s["scene_brief"] for s in scenes]
     candidate_ids = [c.id for c in candidates]
     background_tasks.add_task(
         generate_candidate_batch, candidate_ids, prompts, image_bytes, mime,
@@ -185,10 +186,8 @@ async def candidate_events(
     candidates = await get_candidates_for_round(db, session_id, session.round_number)
 
     async def event_stream():
-        # Subscribe before reading current state to avoid missing events in the gap.
         q = subscribe(session_id)
         try:
-            # Catch-up: replay already-finished candidates immediately.
             all_settled = True
             for c in candidates:
                 if c.generation_status in ("done", "error"):
@@ -229,7 +228,6 @@ async def candidate_events(
                 })
                 return
 
-            # Forward live events from the bus until round_complete.
             while True:
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=20.0)
@@ -261,7 +259,7 @@ def _sse(event: str, data: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# POST /v1/sessions/{session_id}/feedback — submit feedback only               #
+# POST /v1/sessions/{session_id}/feedback — submit feedback only              #
 # --------------------------------------------------------------------------- #
 
 @router.post("/sessions/{session_id}/feedback", response_model=FeedbackResponse)
@@ -280,44 +278,35 @@ async def submit_feedback(
     if candidate is None or candidate.session_id != session_id:
         raise HTTPException(404, "Candidate not found in this session")
 
-    # Get current profile
-    profile = await get_or_create_profile(db, session.user_id)
-    dim_map = await get_dimensions(db, profile.id)
-    profile_scores = {n: d.score for n, d in dim_map.items()}
-    profile_confs = {n: d.confidence for n, d in dim_map.items()}
-    profile_counts = {n: d.interaction_count for n, d in dim_map.items()}
-
-    # Compute reward and update profile
-    reward = compute_reward(body.action)
+    reward = _REWARD_MAP.get(body.action, 0.0)
     logger.info(
         "feedback_received session=%s candidate=%s action=%s reason_tags=%s text_note=%s reward=%.2f",
         session_id, body.candidate_id, body.action, body.reason_tags, body.text_note, reward,
     )
 
-    new_scores, new_confs, new_counts = update_profile_from_feedback(
-        profile_scores,
-        profile_confs,
-        profile_counts,
-        candidate.generation_config,
-        body.action,
-        body.reason_tags,
-        body.chip_dimension_map or None,
+    # Extract corrections and aesthetic updates from feedback
+    aesthetic_tags = (candidate.generation_config or {}).get("aesthetic_tags", [])
+    updates = extract_corrections_and_updates(
+        action=body.action,
+        reason_tags=body.reason_tags,
+        text_note=body.text_note,
+        candidate_image_analysis=candidate.image_analysis,
+        candidate_aesthetic_tags=aesthetic_tags,
     )
 
-    # Persist updated dimensions
-    for dim_name in new_scores:
-        await upsert_dimension(
-            db,
-            profile.id,
-            dim_name,
-            new_scores[dim_name],
-            new_confs[dim_name],
-            new_counts[dim_name],
-        )
-    await increment_profile_interactions(db, profile)
+    # Merge into session creative context
+    context = await get_creative_context(db, session_id)
+    new_context = update_creative_context(
+        context,
+        new_corrections=updates["corrections"],
+        liked_tags=updates["liked_tags"],
+        disliked_tags=updates["disliked_tags"],
+        structural_update=updates["structural_update"],
+        scene_to_add_to_history=None,  # history added in next-round
+    )
+    await save_creative_context(db, session, new_context)
 
-    # Store feedback event (upsert by candidate so edits overwrite prior choice)
-    event = await create_or_update_feedback_event(
+    await create_or_update_feedback_event(
         db,
         session_id=session_id,
         user_id=session.user_id,
@@ -330,10 +319,7 @@ async def submit_feedback(
 
     await db.commit()
 
-    return FeedbackResponse(
-        feedback_accepted=True,
-        reward=reward,
-    )
+    return FeedbackResponse(feedback_accepted=True, reward=reward)
 
 
 # --------------------------------------------------------------------------- #
@@ -360,19 +346,7 @@ async def next_round(
     if not body.force and not await _is_round_feedback_complete(db, session_id, session.round_number):
         raise HTTPException(409, "Feedback incomplete for current round")
 
-    # Get latest profile state for next-round proposal
-    profile = await get_or_create_profile(db, session.user_id)
-    dim_map = await get_dimensions(db, profile.id)
-    profile_scores = {n: d.score for n, d in dim_map.items()}
-
-    # Determine exploit mode (consecutive_likes not used in V1)
-    save_pressed = await _save_exists_for_round(db, session_id, session.round_number)
-    exploit = should_exploit(session.round_number, save_pressed, 0)
-
-    # Advance to next round
-    round_number = await increment_round(db, session)
-
-    # Load product image for next generation
+    # Load product for image bytes + category
     from sqlalchemy import select as sa_select
     from ..db.models import Product
     product_result = await db.execute(sa_select(Product).where(Product.id == session.product_id))
@@ -384,19 +358,40 @@ async def next_round(
     product_image_bytes = product_path.read_bytes()
     mime = _guess_mime(product.image_filename)
 
-    # Generate next 3 configs + prompts
-    configs = generate_three_configs(profile_scores, round_number, None, exploit_mode=exploit)
-    prompts = [compile_prompt(c) for c in configs]
+    # Add scene descriptions from current round to history before advancing
+    context = await get_creative_context(db, session_id)
+    for c in current_candidates:
+        if c.image_analysis and c.image_analysis.get("scene_description"):
+            slot = (c.generation_config or {}).get("slot", "?")
+            entry = f"Round {session.round_number}, {slot}: {c.image_analysis['scene_description']}"
+            context = update_creative_context(context, [], [], [], None, entry)
 
-    # Create candidate rows for next round
+    # Advance round
+    round_number = await increment_round(db, session)
+
+    # Generate 3 new scene briefs
+    scenes = await generate_scene_briefs(context, product.category, round_number)
+    await save_creative_context(db, session, context)
+
     next_candidates: list[Candidate] = []
-    for config, prompt in zip(configs, prompts):
-        c = await create_candidate(db, session_id, round_number, config, prompt)
+    for scene in scenes:
+        c = await create_candidate(
+            db,
+            session_id,
+            round_number,
+            generation_config={
+                "scene_title": scene["scene_title"],
+                "aesthetic_tags": scene["aesthetic_tags"],
+                "slot": scene["slot"],
+                "fields": scene["fields"],
+            },
+            rendered_prompt=scene["scene_brief"],
+        )
         next_candidates.append(c)
 
     await db.commit()
 
-    # Fire generation in background
+    prompts = [s["scene_brief"] for s in scenes]
     next_ids = [c.id for c in next_candidates]
     background_tasks.add_task(
         generate_candidate_batch, next_ids, prompts, product_image_bytes, mime,
@@ -408,11 +403,6 @@ async def next_round(
         round_number=round_number,
         next_candidates=[_candidate_to_out(c) for c in next_candidates],
     )
-
-
-def _count_consecutive_likes(session_id: str, db: AsyncSession) -> int:
-    # Simplified — in V1 we just return 0; proper counting requires session history
-    return 0
 
 
 async def _is_round_feedback_complete(db: AsyncSession, session_id: str, round_number: int) -> bool:
@@ -432,25 +422,6 @@ async def _is_round_feedback_complete(db: AsyncSession, session_id: str, round_n
     )
     reviewed_ids = set(feedback_result.scalars().all())
     return candidate_ids.issubset(reviewed_ids)
-
-
-async def _save_exists_for_round(db: AsyncSession, session_id: str, round_number: int) -> bool:
-    from sqlalchemy import select as sa_select
-    from ..db.models import FeedbackEvent
-
-    round_candidates = await get_candidates_for_round(db, session_id, round_number)
-    if not round_candidates:
-        return False
-    candidate_ids = {c.id for c in round_candidates}
-
-    result = await db.execute(
-        sa_select(FeedbackEvent.id).where(
-            FeedbackEvent.session_id == session_id,
-            FeedbackEvent.action == "save",
-            FeedbackEvent.candidate_id.in_(candidate_ids),
-        )
-    )
-    return result.scalar_one_or_none() is not None
 
 
 def _guess_mime(filename: str) -> str:
@@ -481,11 +452,9 @@ async def finalize(
     if candidate.image_filename is None:
         raise HTTPException(400, "Selected candidate image is not yet generated")
 
-    # Generate export crops
     hero_path = settings.outputs_dir / candidate.image_filename
     feed_filename, story_filename = _make_export_crops(hero_path, candidate.id)
 
-    # Finalize session
     await finalize_session(db, session)
     await db.commit()
 
@@ -520,18 +489,15 @@ def _make_export_crops(hero_path, candidate_id: str) -> tuple[str, str]:
     src_ratio = w / h
 
     if src_ratio > target_ratio:
-        # Image is wider than 9:16 → crop width
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
         story_img = img.crop((left, 0, left + new_w, h)).resize((target_w, target_h), Image.LANCZOS)
     else:
-        # Image is taller or narrower → pad top/bottom with white
         new_h = int(w / target_ratio)
         if new_h <= h:
             top = (h - new_h) // 2
             story_img = img.crop((0, top, w, top + new_h)).resize((target_w, target_h), Image.LANCZOS)
         else:
-            # Pad with white
             canvas = Image.new("RGB", (w, new_h), (255, 255, 255))
             y_offset = (new_h - h) // 2
             canvas.paste(img, (0, y_offset))

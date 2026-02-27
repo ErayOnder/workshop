@@ -44,6 +44,7 @@ class Session(Base):
     round_number: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    creative_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="sessions", lazy="select")
     candidates: Mapped[list["Candidate"]] = relationship(back_populates="session", lazy="select")

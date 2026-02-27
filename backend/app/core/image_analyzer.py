@@ -9,11 +9,18 @@ from google import genai
 from google.genai import types
 
 from ..config import settings
-from .dimensions import ALL_DIMENSIONS
 
 logger = logging.getLogger(__name__)
 
-_ALL_DIMS_STR = ", ".join(ALL_DIMENSIONS)
+# Kept here for chip validation — chips must reference known dimension names
+# so the frontend chip-dimension map remains meaningful.
+_ALL_DIMENSIONS = [
+    "model_presence", "model_style", "skin_tone_preference", "pose_type",
+    "framing", "product_position", "lighting_softness", "lighting_direction",
+    "color_temperature", "background_complexity", "background_palette",
+    "atmosphere", "retouch_intensity", "product_prominence",
+]
+_ALL_DIMS_STR = ", ".join(_ALL_DIMENSIONS)
 
 _ANALYSIS_PROMPT = f"""You are a jewelry photography critic analyzing a single AI-generated jewelry marketing photo.
 
@@ -21,6 +28,7 @@ Analyze what is visually notable in this image. Generate feedback chips that a u
 
 Return ONLY valid JSON matching this exact schema, no markdown, no extra text:
 {{
+  "scene_description": "<one factual sentence describing what is physically in this image: location type, lighting source and quality, model presence, product position>",
   "like_chips": [
     {{"id": "<slug>", "label": "<2-5 word description>", "dimensions": ["<dim1>"]}}
   ],
@@ -30,6 +38,7 @@ Return ONLY valid JSON matching this exact schema, no markdown, no extra text:
 }}
 
 Rules:
+- scene_description: one factual sentence, describe what you see (not what you feel), e.g. "Ring on a hand against a dark velvet background, dramatic side lighting from the left, deep shadows"
 - Generate 3 to 5 like_chips and 3 to 5 dislike_chips
 - Each chip id must be lowercase with underscores only (e.g. warm_golden_glow)
 - Each chip label must describe something visually specific to THIS image in 2-5 words
@@ -43,7 +52,7 @@ Rules:
 def _validate_chips(chips: list) -> list[dict]:
     """Validate and clean a list of chips. Strips invalid dimensions, caps at 5."""
     valid = []
-    dim_set = set(ALL_DIMENSIONS)
+    dim_set = set(_ALL_DIMENSIONS)
     for chip in chips[:5]:
         if not isinstance(chip, dict):
             continue
@@ -113,7 +122,12 @@ async def analyze_image(image_bytes: bytes) -> dict | None:
                 )
                 return None
 
-            return {"like_chips": like_chips, "dislike_chips": dislike_chips}
+            scene_description = str(data.get("scene_description", "")).strip()
+            return {
+                "scene_description": scene_description,
+                "like_chips": like_chips,
+                "dislike_chips": dislike_chips,
+            }
 
         except json.JSONDecodeError as exc:
             last_error = exc
