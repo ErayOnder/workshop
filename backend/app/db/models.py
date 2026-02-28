@@ -19,9 +19,6 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", lazy="select")
-    preference_profile: Mapped["UserPreferenceProfile | None"] = relationship(
-        back_populates="user", uselist=False, lazy="select"
-    )
 
 
 class Product(Base):
@@ -92,33 +89,3 @@ class FeedbackEvent(Base):
     session: Mapped["Session"] = relationship(back_populates="feedback_events", lazy="select")
 
 
-class UserPreferenceProfile(Base):
-    __tablename__ = "user_preference_profiles"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True)
-    total_interactions: Mapped[int] = mapped_column(Integer, default=0)
-    last_updated: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    user: Mapped["User"] = relationship(back_populates="preference_profile", lazy="select")
-    dimensions: Mapped[list["UserPreferenceDimension"]] = relationship(
-        back_populates="profile", lazy="select"
-    )
-
-
-class UserPreferenceDimension(Base):
-    __tablename__ = "user_preference_dimensions"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
-    profile_id: Mapped[str] = mapped_column(ForeignKey("user_preference_profiles.id"))
-    dimension_name: Mapped[str] = mapped_column(String)
-    score: Mapped[float] = mapped_column(Float, default=0.0)       # [-1.0, +1.0]
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)  # [0.0, 1.0]
-    interaction_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_updated: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    profile: Mapped["UserPreferenceProfile"] = relationship(back_populates="dimensions", lazy="select")
-
-    __table_args__ = (
-        Index("ix_dim_profile_name", "profile_id", "dimension_name", unique=True),
-    )

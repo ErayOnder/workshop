@@ -45,3 +45,16 @@ async def create_or_update_feedback_event(
 
     await db.flush()
     return event
+
+
+async def get_feedback_candidate_ids_for_round(
+    db: AsyncSession, session_id: str, candidate_ids: set[str]
+) -> set[str]:
+    """Return the subset of candidate_ids that have at least one feedback event."""
+    result = await db.execute(
+        select(FeedbackEvent.candidate_id).where(
+            FeedbackEvent.session_id == session_id,
+            FeedbackEvent.candidate_id.in_(candidate_ids),
+        )
+    )
+    return set(result.scalars().all())

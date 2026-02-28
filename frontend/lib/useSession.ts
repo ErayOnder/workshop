@@ -18,7 +18,6 @@ import type {
   FinalizeResult,
   JewelryCategory,
   ScreenPhase,
-  SessionState,
 } from "./types";
 
 const USER_ID_KEY = "workshop_user_id";
@@ -91,6 +90,7 @@ export function useSession(): SessionHook {
     }
   }, []);
 
+  // SSE stream with all event handlers including candidates_created
   const startStream = useCallback(
     (sid: string) => {
       stopStream();
@@ -102,6 +102,11 @@ export function useSession(): SessionHook {
       };
 
       eventSourceRef.current = openCandidateStream(sid, {
+        onCandidatesCreated: (e) => {
+          setCandidates(e.candidates);
+          setSelectedCandidateId(e.candidates[0]?.candidate_id ?? null);
+          setRoundNumber(e.round_number);
+        },
         onCandidateDone: (e: CandidateDoneEvent) => {
           patchCandidate(e.candidate_id, {
             generation_status: e.generation_status,
@@ -118,7 +123,12 @@ export function useSession(): SessionHook {
         },
         onRoundComplete: (e) => {
           setRoundNumber(e.round_number);
+          setIsLoading(false);
           eventSourceRef.current = null;
+        },
+        onPipelineError: (e) => {
+          setError(`Generation failed: ${e.error}`);
+          setIsLoading(false);
         },
       });
     },
@@ -129,28 +139,31 @@ export function useSession(): SessionHook {
     return () => stopStream();
   }, [stopStream]);
 
+  // ── Session creation (SSE-first) ─────────────────────────────────────── //
+
   const startSession = useCallback(
     async (file: File, category?: JewelryCategory) => {
       setIsLoading(true);
       setError(null);
+      setCandidates([]);
+      setSavedCandidateId(null);
+      setFeedbackByCandidate({});
+      setFinalizeResult(null);
+      setPendingFeedbackCount(0);
+      pendingFeedbackRequestsRef.current.clear();
+
       try {
-        const session: SessionState = await createSession(file, userId, category);
-        setSessionId(session.session_id);
-        setRoundNumber(session.round_number);
-        setCandidates(session.candidates);
-        setSelectedCandidateId(session.candidates[0]?.candidate_id ?? null);
-        setSavedCandidateId(null);
-        setFeedbackByCandidate({});
-        setFinalizeResult(null);
-        setPendingFeedbackCount(0);
-        pendingFeedbackRequestsRef.current.clear();
+        const result = await createSession(file, userId, category);
+        setSessionId(result.session_id);
+        setRoundNumber(result.round_number);
         setPhase("review");
-        startStream(session.session_id);
+        // Start SSE stream — candidates arrive via candidates_created event
+        startStream(result.session_id);
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : "Failed to start session");
-      } finally {
         setIsLoading(false);
       }
+      // isLoading stays true until round_complete or pipeline_error via SSE
     },
     [userId, startStream]
   );
@@ -159,26 +172,37 @@ export function useSession(): SessionHook {
     setSelectedCandidateId(id);
   }, []);
 
+  // ── Next round (SSE-first) ───────────────────────────────────────────── //
+
   const advanceToNextRound = useCallback(
     async () => {
       if (!sessionId) return;
+
+      // Clear old round state
+      setCandidates([]);
+      setSelectedCandidateId(null);
+      setFeedbackByCandidate({});
+      setPendingFeedbackCount(0);
+      setError(null);
+
+      // Start SSE stream BEFORE calling the API so we never miss
+      // the candidates_created event from the background pipeline.
+      startStream(sessionId);
+
       try {
         const result = await nextRound(sessionId, true);
-        const next = result.next_candidates;
-        setCandidates(next);
         setRoundNumber(result.round_number);
-        setSelectedCandidateId(next[0]?.candidate_id ?? null);
-        setFeedbackByCandidate({});
-        setPendingFeedbackCount(0);
-        setError(null);
-        startStream(sessionId);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Failed to load next round";
         setError(message);
+        setIsLoading(false);
       }
+      // isLoading stays true until round_complete or pipeline_error via SSE
     },
     [sessionId, startStream]
   );
+
+  // ── Feedback ─────────────────────────────────────────────────────────── //
 
   const submitFeedbackAction = useCallback(
     async (
@@ -190,7 +214,7 @@ export function useSession(): SessionHook {
       if (!sessionId || !selectedCandidateId) return;
       if (action === "save") setSavedCandidateId(selectedCandidateId);
 
-      // Optimistic local update so revisiting a candidate shows prior choice immediately.
+      // Optimistic local update
       const prev = feedbackByCandidate[selectedCandidateId] ?? emptyFeedback();
       const updatedEntry: CandidateLocalFeedback =
         action === "like"
@@ -202,7 +226,7 @@ export function useSession(): SessionHook {
       setFeedbackByCandidate(updatedFeedback);
       setError(null);
 
-      // Move to next unactioned candidate; next-round is now explicit via the Next button.
+      // Move to next unactioned candidate
       const nextUnactioned = candidates.find((c) => {
         const fb = updatedFeedback[c.candidate_id];
         return !fb?.like.submitted && !fb?.dislike.submitted;
@@ -234,17 +258,27 @@ export function useSession(): SessionHook {
     [sessionId, selectedCandidateId, candidates, feedbackByCandidate]
   );
 
-  const goNextRound = useCallback(async () => {
-    // Prevent race: wait for all in-flight feedback writes before generation starts.
-    const inflight = Array.from(pendingFeedbackRequestsRef.current);
-    if (inflight.length > 0) {
-      await Promise.allSettled(inflight);
-    }
+  // ── Go next round ───────────────────────────────────────────────────── //
 
-    await advanceToNextRound();
+  const goNextRound = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      // Wait for any in-flight feedback writes before advancing.
+      const inflight = Array.from(pendingFeedbackRequestsRef.current);
+      if (inflight.length > 0) {
+        await Promise.allSettled(inflight);
+      }
+      await advanceToNextRound();
+    } catch {
+      setIsLoading(false);
+    }
+    // isLoading stays true until round_complete or pipeline_error via SSE
   }, [advanceToNextRound]);
 
   const canGoNext = candidates.length > 0 && !isLoading;
+
+  // ── Finalize ─────────────────────────────────────────────────────────── //
 
   const doFinalize = useCallback(
     async (selectedId: string) => {
@@ -264,6 +298,8 @@ export function useSession(): SessionHook {
     },
     [sessionId, stopStream]
   );
+
+  // ── Reset ────────────────────────────────────────────────────────────── //
 
   const resetToUpload = useCallback(() => {
     stopStream();

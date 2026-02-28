@@ -1,26 +1,16 @@
 from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..db.models import Session, User, Product
+from ..db.models import Session
 
 
-async def ensure_user(db: AsyncSession, user_id: str) -> User:
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user is None:
-        user = User(id=user_id)
-        db.add(user)
-        await db.flush()
-    return user
-
-
-async def create_product(
-    db: AsyncSession, user_id: str, category: str | None, image_filename: str
-) -> Product:
-    product = Product(user_id=user_id, category=category, image_filename=image_filename)
-    db.add(product)
-    await db.flush()
-    return product
+EMPTY_CONTEXT: dict = {
+    "structural": {},
+    "corrections": [],
+    "scene_history": [],
+    "liked_tags": [],
+    "disliked_tags": [],
+}
 
 
 async def create_session(db: AsyncSession, user_id: str, product_id: str) -> Session:
@@ -47,7 +37,7 @@ async def finalize_session(db: AsyncSession, session: Session) -> None:
     await db.flush()
 
 
-_EMPTY_CONTEXT: dict = {
+EMPTY_CONTEXT: dict = {
     "structural": {},
     "corrections": [],
     "scene_history": [],
@@ -60,7 +50,7 @@ async def get_creative_context(db: AsyncSession, session_id: str) -> dict:
     result = await db.execute(select(Session).where(Session.id == session_id))
     session = result.scalar_one_or_none()
     if session is None or session.creative_context is None:
-        return dict(_EMPTY_CONTEXT)
+        return dict(EMPTY_CONTEXT)
     return dict(session.creative_context)
 
 

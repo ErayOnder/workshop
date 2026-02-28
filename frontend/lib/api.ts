@@ -1,4 +1,4 @@
-import type { Candidate, FeedbackAction, FinalizeResult, JewelryCategory, SessionState } from "./types";
+import type { Candidate, FeedbackAction, FinalizeResult, JewelryCategory } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 
@@ -10,19 +10,35 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json();
 }
 
+// ── Session creation ───────────────────────────────────────────────────── //
+
+export type CreateSessionResult = {
+  session_id: string;
+  user_id: string;
+  round_number: number;
+};
+
 export async function createSession(
   file: File,
   userId: string,
   category?: JewelryCategory
-): Promise<SessionState> {
+): Promise<CreateSessionResult> {
   const form = new FormData();
   form.append("image", file);
   form.append("user_id", userId);
   if (category) form.append("category", category);
 
   const res = await fetch(`${API_URL}/v1/sessions`, { method: "POST", body: form });
-  return handleResponse<SessionState>(res);
+  return handleResponse<CreateSessionResult>(res);
 }
+
+// ── SSE event types ────────────────────────────────────────────────────── //
+
+export type CandidatesCreatedEvent = {
+  session_id: string;
+  round_number: number;
+  candidates: Candidate[];
+};
 
 export type CandidateDoneEvent = {
   candidate_id: string;
@@ -43,16 +59,32 @@ export type RoundCompleteEvent = {
   round_number: number;
 };
 
+export type PipelineErrorEvent = {
+  session_id: string;
+  round_number: number;
+  error: string;
+};
+
+// ── SSE stream ─────────────────────────────────────────────────────────── //
+
 export function openCandidateStream(
   sessionId: string,
   handlers: {
+    onCandidatesCreated?: (e: CandidatesCreatedEvent) => void;
     onCandidateDone: (e: CandidateDoneEvent) => void;
     onAnalysisDone: (e: AnalysisDoneEvent) => void;
     onRoundComplete: (e: RoundCompleteEvent) => void;
+    onPipelineError?: (e: PipelineErrorEvent) => void;
     onError?: (err: Event) => void;
   }
 ): EventSource {
   const es = new EventSource(`${API_URL}/v1/sessions/${sessionId}/events`);
+
+  if (handlers.onCandidatesCreated) {
+    es.addEventListener("candidates_created", (e: MessageEvent) => {
+      handlers.onCandidatesCreated!(JSON.parse(e.data) as CandidatesCreatedEvent);
+    });
+  }
 
   es.addEventListener("candidate_done", (e: MessageEvent) => {
     handlers.onCandidateDone(JSON.parse(e.data) as CandidateDoneEvent);
@@ -67,12 +99,21 @@ export function openCandidateStream(
     es.close();
   });
 
+  if (handlers.onPipelineError) {
+    es.addEventListener("pipeline_error", (e: MessageEvent) => {
+      handlers.onPipelineError!(JSON.parse(e.data) as PipelineErrorEvent);
+      es.close();
+    });
+  }
+
   if (handlers.onError) {
     es.onerror = handlers.onError;
   }
 
   return es;
 }
+
+// ── Feedback ───────────────────────────────────────────────────────────── //
 
 export async function submitFeedback(
   sessionId: string,
@@ -96,10 +137,12 @@ export async function submitFeedback(
   return handleResponse(res);
 }
 
+// ── Next round ─────────────────────────────────────────────────────────── //
+
 export async function nextRound(
   sessionId: string,
   force = false
-): Promise<{ advanced: boolean; round_number: number; next_candidates: Candidate[] }> {
+): Promise<{ advanced: boolean; round_number: number }> {
   const res = await fetch(`${API_URL}/v1/sessions/${sessionId}/next-round`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -107,6 +150,8 @@ export async function nextRound(
   });
   return handleResponse(res);
 }
+
+// ── Finalize ───────────────────────────────────────────────────────────── //
 
 export async function finalizeSession(
   sessionId: string,
@@ -119,6 +164,8 @@ export async function finalizeSession(
   });
   return handleResponse<FinalizeResult>(res);
 }
+
+// ── Helpers ────────────────────────────────────────────────────────────── //
 
 export function imageUrl(relativeUrl: string): string {
   return `${API_URL}${relativeUrl}`;

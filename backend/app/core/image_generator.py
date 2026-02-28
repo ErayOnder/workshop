@@ -1,6 +1,6 @@
 from google import genai
 from google.genai import types
-from .config import settings
+from ..config import settings
 
 
 async def generate_one(image_bytes: bytes, mime: str, prompt: str) -> bytes:
