@@ -83,13 +83,16 @@ async def run_round_pipeline(
                 })
             await db.commit()
 
+        logger.info("Pipeline: %d candidates created, publishing SSE", len(candidate_ids))
         await publish(session_id, "candidates_created", {
             "session_id": session_id,
             "round_number": round_number,
             "candidates": candidates_out,
         })
 
+        logger.info("Pipeline: starting parallel image generation for %d candidates", len(candidate_ids))
         await _run_image_generation(candidate_ids, prompts, product_image_bytes, mime, session_id)
+        logger.info("Pipeline: image generation complete for session=%s round=%d", session_id, round_number)
 
     except Exception as exc:
         logger.error("Pipeline failed session=%s round=%d: %s", session_id, round_number, exc)
@@ -162,6 +165,7 @@ async def _generate_single(
         await _analyze_single(candidate_id, session_id, image_bytes)
 
     except Exception as exc:
+        logger.error("Image generation failed candidate=%s: %s", candidate_id, exc)
         async with AsyncSessionLocal() as db:
             await set_candidate_error(db, candidate_id, str(exc))
             await db.commit()

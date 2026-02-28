@@ -65,7 +65,9 @@ async def candidate_events(
     async def event_stream():
         q = subscribe(session_id)
         try:
-            all_settled = True
+            # If no candidates exist yet (pipeline hasn't created them),
+            # skip the replay phase and go straight to listening for events.
+            all_settled = len(candidates) > 0
             for c in candidates:
                 if c.generation_status in ("done", "error"):
                     yield _sse("candidate_done", {

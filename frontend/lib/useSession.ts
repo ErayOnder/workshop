@@ -185,13 +185,12 @@ export function useSession(): SessionHook {
       setPendingFeedbackCount(0);
       setError(null);
 
-      // Start SSE stream BEFORE calling the API so we never miss
-      // the candidates_created event from the background pipeline.
-      startStream(sessionId);
-
       try {
         const result = await nextRound(sessionId, true);
         setRoundNumber(result.round_number);
+        // Start SSE stream AFTER the API returns. The pipeline runs as a
+        // BackgroundTask (after response), so we won't miss any events.
+        startStream(sessionId);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Failed to load next round";
         setError(message);
